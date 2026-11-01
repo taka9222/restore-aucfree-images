@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Aucfree Yahoo Auction Image Restorer
 // @namespace    https://aucfree.com/
-// @version      1.1
+// @version      1.1.1
 // @description  Restore missing Aucfree item images and archive Yahoo auction images and text.
 // @match        https://aucfree.com/*
 // @match        https://www.aucfree.com/*
@@ -189,10 +189,13 @@
       value: clean(dl.querySelector('dd')?.textContent || '')
     }));
     const fullText = clean(doc.body?.innerText || doc.body?.textContent || '');
-    const derived = deriveAuctionMetadata(fullText);
-    const auctionDate = details.find(item => /終了日時|落札日時|取引日時/.test(item.label))?.value || derived.auctionDate;
-    const labeledPrice = details.find(item => /^(落札価格|落札額|落札金額|現在価格|価格)$/.test(item.label))?.value || '';
-    const price = clean(doc.querySelector('#item_info_box .bid_price, .bid_price')?.textContent || labeledPrice || derived.price);
+    const derived = deriveAuctionMetadata(fullText, id);
+    const embedded = deriveYahooEmbeddedMetadata(html, id);
+    const auctionDate = details.find(item => /終了日時|落札日時|取引日時/.test(item.label))?.value || embedded.auctionDate || derived.auctionDate;
+    const labeledPrice = details.find(item => /^(落札価格|落札額|落札金額|現在価格|価格)\s*[:：]?$/.test(item.label))?.value || '';
+    const price = clean(doc.querySelector('#item_info_box .bid_price, .bid_price')?.textContent || labeledPrice || embedded.price || derived.price);
+    const bidLabel = details.find(item => /^入札件数\s*[:：]?$/.test(item.label))?.value || '';
+    const bidCount = bidLabel.match(/[\d,]+/)?.[0] || embedded.bidCount || derived.bidCount;
     return {
       id,
       sourceUrl: `https://auctions.yahoo.co.jp/jp/auction/${encodeURIComponent(id)}`,
@@ -200,6 +203,7 @@
       title: clean(doc.title || ''),
       auctionDate,
       price,
+      bidCount,
       text: fullText,
       descriptionText: clean(descriptionParts.join('\n\n'))
     };
@@ -212,7 +216,24 @@
       request.onerror = () => reject(request.error);
     });
   }
-  function deriveAuctionMetadata(text) {
+  function deriveYahooEmbeddedMetadata(source, id) {
+    if (!source || !id) return { auctionDate: '', price: '', bidCount: '' };
+    const escapedId = String(id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const marker = new RegExp(`"auctionId"\\s*:\\s*"${escapedId}"`).exec(source);
+    if (!marker) return { auctionDate: '', price: '', bidCount: '' };
+    // Yahoo's __NEXT_DATA__ item detail state keeps the canonical sale price
+    // and endTime as JSON fields, even when the visible labels are missing.
+    const itemState = source.slice(marker.index, marker.index + 12000);
+    const rawPrice = itemState.match(/"price"\s*:\s*(\d+(?:\.\d+)?)/)?.[1];
+    const rawBidCount = itemState.match(/"bids"\s*:\s*(\d+)/)?.[1];
+    const rawEndTime = itemState.match(/"endTime"\s*:\s*"((?:19|20)\d{2}-\d{2}-\d{2}T[^" ]+)"/)?.[1];
+    const price = rawPrice === undefined ? '' : `${Number(rawPrice).toLocaleString('ja-JP')}円`;
+    const auctionDate = rawEndTime ? rawEndTime.replace('T', ' ').replace(/([+-]\d{2}:\d{2})$/, '') : '';
+    const bidCount = rawBidCount === undefined ? '' : rawBidCount;
+    return { auctionDate, price, bidCount };
+  }
+
+  function deriveAuctionMetadata(text, id) {
     const normalized = String(text || '').normalize('NFKC');
     const flattened = normalized.replace(/[\s\u00a0]+/g, ' ');
     const date = flattened.match(/(?:終了日時|落札日時|取引日時)\s*[:：]?\s*((?:19|20)\d{2}[年/-]\d{1,2}[月/-]\d{1,2}日?(?:\s*\d{1,2}時\d{1,2}分?)?)/);
@@ -228,9 +249,12 @@
         pricePriority = priority;
       }
     }
+    const bid = flattened.match(/入札件数\s*[:：]?\s*([\d,]+)/);
+    const embedded = deriveYahooEmbeddedMetadata(normalized, id);
     return {
-      auctionDate: date?.[1]?.trim() || '',
-      price
+      auctionDate: date?.[1]?.trim() || embedded.auctionDate,
+      price: embedded.price || price,
+      bidCount: embedded.bidCount || bid?.[1]?.replace(/,/g, '') || ''
     };
   }
   async function readAuctionText(id) {
@@ -241,13 +265,14 @@
         request.onsuccess = () => {
           const record = request.result || null;
           if (!record) { resolve(null); return; }
-          const derived = deriveAuctionMetadata(record.text);
+          const derived = deriveAuctionMetadata(record.text, id);
           const updated = {
             ...record,
             auctionDate: record.auctionDate || derived.auctionDate,
-            price: record.price || derived.price
+            price: record.price || derived.price,
+            bidCount: record.bidCount ?? derived.bidCount
           };
-          if (updated.auctionDate === record.auctionDate && updated.price === record.price) {
+          if (updated.auctionDate === record.auctionDate && updated.price === record.price && updated.bidCount === record.bidCount) {
             resolve(record);
             return;
           }
@@ -677,6 +702,8 @@
       const priceFromText = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean).find(line => /^(落札価格|落札額)\s*[:：]?/.test(line));
       appendInspectorField(result, '取引日時', record?.auctionDate || (dateFromText ? dateFromText.replace(/^(終了日時|落札日時|取引日時)\s*[:：]?\s*/, '') : ''));
       appendInspectorField(result, '価格', record?.price || (priceFromText ? priceFromText.replace(/^(落札価格|落札額)\s*[:：]?\s*/, '') : ''));
+      const bidCount = record?.bidCount ?? deriveAuctionMetadata(text, id).bidCount;
+      appendInspectorField(result, '入札件数', bidCount === '' || bidCount == null ? '' : `${bidCount}件`);
       const imageSection = document.createElement('section');
       imageSection.style.cssText = 'margin-top:14px;';
       const imageTitle = document.createElement('h3');

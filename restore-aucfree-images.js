@@ -188,9 +188,11 @@
       label: clean(dl.querySelector('dt')?.textContent || ''),
       value: clean(dl.querySelector('dd')?.textContent || '')
     }));
-    const auctionDate = details.find(item => /終了日時|落札日時|取引日時/.test(item.label))?.value || '';
-    const price = clean(doc.querySelector('.bid_price')?.textContent ||
-      details.find(item => /落札価格|落札額/.test(item.label))?.value || '');
+    const fullText = clean(doc.body?.innerText || doc.body?.textContent || '');
+    const derived = deriveAuctionMetadata(fullText);
+    const auctionDate = details.find(item => /終了日時|落札日時|取引日時/.test(item.label))?.value || derived.auctionDate;
+    const labeledPrice = details.find(item => /^(落札価格|落札額|落札金額|現在価格|価格)$/.test(item.label))?.value || '';
+    const price = clean(doc.querySelector('#item_info_box .bid_price, .bid_price')?.textContent || labeledPrice || derived.price);
     return {
       id,
       sourceUrl: `https://auctions.yahoo.co.jp/jp/auction/${encodeURIComponent(id)}`,
@@ -198,7 +200,7 @@
       title: clean(doc.title || ''),
       auctionDate,
       price,
-      text: clean(doc.body?.innerText || doc.body?.textContent || ''),
+      text: fullText,
       descriptionText: clean(descriptionParts.join('\n\n'))
     };
   }
@@ -210,12 +212,51 @@
       request.onerror = () => reject(request.error);
     });
   }
+  function deriveAuctionMetadata(text) {
+    const normalized = String(text || '').normalize('NFKC');
+    const flattened = normalized.replace(/[\s\u00a0]+/g, ' ');
+    const date = flattened.match(/(?:終了日時|落札日時|取引日時)\s*[:：]?\s*((?:19|20)\d{2}[年/-]\d{1,2}[月/-]\d{1,2}日?(?:\s*\d{1,2}時\d{1,2}分?)?)/);
+    const pricePattern = /(?:^|[\s:：])(?:落札価格|落札額|落札金額|現在価格|価格)\s*[:：]?\s*(?:[¥￥]\s*)?([\d,]+(?:\.\d+)?)\s*(円)?/g;
+    let price = '';
+    let pricePriority = -1;
+    for (const match of flattened.matchAll(pricePattern)) {
+      const label = match[0];
+      // Prefer a completed-sale label over a generic price or current/start price.
+      const priority = /落札価格|落札額|落札金額/.test(label) ? 2 : /現在価格/.test(label) ? 1 : 0;
+      if (!price || priority > pricePriority) {
+        price = `${match[1]}${match[2] ? '円' : ''}`;
+        pricePriority = priority;
+      }
+    }
+    return {
+      auctionDate: date?.[1]?.trim() || '',
+      price
+    };
+  }
   async function readAuctionText(id) {
     try {
       const db = await openDb();
       return await new Promise((resolve, reject) => {
         const request = db.transaction(textStore, 'readonly').objectStore(textStore).get(id);
-        request.onsuccess = () => resolve(request.result || null);
+        request.onsuccess = () => {
+          const record = request.result || null;
+          if (!record) { resolve(null); return; }
+          const derived = deriveAuctionMetadata(record.text);
+          const updated = {
+            ...record,
+            auctionDate: record.auctionDate || derived.auctionDate,
+            price: record.price || derived.price
+          };
+          if (updated.auctionDate === record.auctionDate && updated.price === record.price) {
+            resolve(record);
+            return;
+          }
+          try {
+            const writeRequest = db.transaction(textStore, 'readwrite').objectStore(textStore).put(updated);
+            writeRequest.onsuccess = () => resolve(updated);
+            writeRequest.onerror = () => resolve(record);
+          } catch { resolve(record); }
+        };
         request.onerror = () => reject(request.error);
       });
     } catch { return null; }
@@ -566,6 +607,18 @@
     dialog.style.cssText = 'width:min(760px,calc(100vw - 32px));max-width:760px;max-height:88vh;padding:0;border:1px solid #777;border-radius:10px;color:#222;box-shadow:0 8px 36px rgba(0,0,0,.35);font:14px/1.5 sans-serif;';
     dialog.innerHTML = '<div style="position:sticky;top:0;z-index:1;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#f5f5f5;border-bottom:1px solid #ddd"><strong>商品キャッシュの確認</strong><button type="button" data-inspector-close aria-label="閉じる" style="font-size:20px;border:0;background:transparent;cursor:pointer">×</button></div><form data-inspector-form style="display:flex;gap:8px;padding:12px 16px"><input data-inspector-id type="text" required autocomplete="off" placeholder="商品ID または https://aucfree.com/items/商品ID" style="flex:1;min-width:0;padding:8px;border:1px solid #999;border-radius:5px"><button type="submit" style="padding:8px 14px;border:1px solid #555;border-radius:5px;background:#fff;cursor:pointer">表示</button></form><div data-inspector-status role="status" style="padding:0 16px;color:#555"></div><div data-inspector-result style="padding:0 16px 16px;overflow-wrap:anywhere"></div>';
     dialog.addEventListener('close', revokeCacheInspectorUrls);
+    dialog.addEventListener('keydown', event => {
+      const target = event.target;
+      const isEditable = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable;
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v') {
+        // Keep site-level shortcuts from dismissing the inspector while preserving paste.
+        event.stopPropagation();
+      }
+      if (event.key === 'Backspace') {
+        event.stopPropagation();
+        if (!isEditable) event.preventDefault();
+      }
+    }, true);
     dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
     dialog.querySelector('[data-inspector-close]').addEventListener('click', () => dialog.close());
     dialog.querySelector('[data-inspector-form]').addEventListener('submit', event => {
@@ -655,14 +708,31 @@
         imageSection.append(figure);
       }
       result.append(imageSection);
-      const descriptionTitle = document.createElement('h3');
-      descriptionTitle.style.cssText = 'font-size:15px;margin:14px 0 6px;';
-      descriptionTitle.textContent = '商品紹介文';
-      result.append(descriptionTitle);
-      const description = document.createElement('pre');
-      description.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:10px;border:1px solid #ddd;border-radius:5px;background:#fafafa;font:13px/1.5 sans-serif;max-height:260px;overflow:auto;';
-      description.textContent = record?.descriptionText || '商品紹介文のキャッシュはありません。';
-      result.append(description);
+      const textSection = document.createElement('section');
+      textSection.style.cssText = 'margin-top:14px;';
+      const textControls = document.createElement('div');
+      textControls.style.cssText = 'display:flex;align-items:center;gap:8px;margin:14px 0 6px;';
+      const textTitle = document.createElement('h3');
+      textTitle.style.cssText = 'font-size:15px;margin:0;';
+      textTitle.textContent = 'テキスト';
+      const textMode = document.createElement('select');
+      textMode.setAttribute('aria-label', '表示するテキスト');
+      textMode.style.cssText = 'padding:4px 7px;border:1px solid #999;border-radius:4px;background:#fff;';
+      textMode.innerHTML = '<option value="description">商品紹介文</option><option value="raw">rawテキスト</option>';
+      textControls.append(textTitle, textMode);
+      const textContent = document.createElement('pre');
+      textContent.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:10px;border:1px solid #ddd;border-radius:5px;background:#fafafa;font:13px/1.5 sans-serif;max-height:260px;overflow:auto;';
+      const descriptionText = record?.descriptionText || '';
+      const rawText = record?.text || '';
+      const noTextMessage = 'テキストキャッシュはありません。';
+      const updateTextContent = () => {
+        const selectedText = textMode.value === 'raw' ? rawText : descriptionText;
+        textContent.textContent = selectedText || noTextMessage;
+      };
+      textMode.addEventListener('change', updateTextContent);
+      updateTextContent();
+      textSection.append(textControls, textContent);
+      result.append(textSection);
       status.textContent = record ? 'キャッシュ内容を表示しています。' : 'auction-textのキャッシュはありません。画像キャッシュがあれば続けて表示します。';
     } catch (error) {
       status.textContent = `キャッシュの読み込みに失敗しました: ${error?.message || error}`;
@@ -673,6 +743,7 @@
     const input = dialog.querySelector('[data-inspector-id]');
     if (!dialog.open) dialog.showModal();
     input.focus();
+    input.select();
   }
   function trackCacheJob(id, job) {
     const key = cacheKey(id, job.kind, job.index);
@@ -1230,6 +1301,8 @@
   });
   observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data-src', 'alt'] });
 })();
+
+
 
 
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Aucfree Yahoo Auction Image Restorer
 // @namespace    https://aucfree.com/
-// @version      1.1.1
+// @version      1.1.2
 // @description  Restore missing Aucfree item images and archive Yahoo auction images and text.
 // @match        https://aucfree.com/*
 // @match        https://www.aucfree.com/*
@@ -174,16 +174,18 @@
   }
   function extractAuctionText(html, id) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
+    const clean = value => value.replace(/\r/g, '').replace(/[\t\f\v ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     const descriptionParts = [];
-    for (const root of doc.querySelectorAll('#description, [id*="description" i], [class*="description" i]')) {
-      const visibleText = root.innerText || root.textContent || '';
+    for (const root of doc.querySelectorAll('#description, [id*="description" i], [class*="description" i], #item_desc')) {
+      const content = root.cloneNode(true);
+      content.querySelectorAll('h2.item_lead, .anc_pagetop').forEach(node => node.remove());
+      const visibleText = content.innerText || content.textContent || '';
       if (visibleText.trim()) descriptionParts.push(visibleText);
       root.querySelectorAll('template').forEach(template => {
         const templateText = template.content.textContent || '';
         if (templateText.trim()) descriptionParts.push(templateText);
       });
     }
-    const clean = value => value.replace(/\r/g, '').replace(/[\t\f\v ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     const details = [...doc.querySelectorAll('dl')].map(dl => ({
       label: clean(dl.querySelector('dt')?.textContent || ''),
       value: clean(dl.querySelector('dd')?.textContent || '')
@@ -191,6 +193,15 @@
     const fullText = clean(doc.body?.innerText || doc.body?.textContent || '');
     const derived = deriveAuctionMetadata(fullText, id);
     const embedded = deriveYahooEmbeddedMetadata(html, id);
+    const aucfreeDescriptionRoot = doc.querySelector('#item_desc');
+    let aucfreeDescriptionHtml = '';
+    if (aucfreeDescriptionRoot) {
+      const content = aucfreeDescriptionRoot.cloneNode(true);
+      content.querySelectorAll('h2.item_lead, .anc_pagetop').forEach(node => node.remove());
+      aucfreeDescriptionHtml = content.innerHTML || '';
+    }
+    const descriptionHtml = embedded.descriptionHtml || aucfreeDescriptionHtml;
+    const descriptionText = compactDescriptionText(embedded.descriptionText || clean(descriptionParts.join('\n\n')) || deriveAucfreeDescription(fullText));
     const auctionDate = details.find(item => /終了日時|落札日時|取引日時/.test(item.label))?.value || embedded.auctionDate || derived.auctionDate;
     const labeledPrice = details.find(item => /^(落札価格|落札額|落札金額|現在価格|価格)\s*[:：]?$/.test(item.label))?.value || '';
     const price = clean(doc.querySelector('#item_info_box .bid_price, .bid_price')?.textContent || labeledPrice || embedded.price || derived.price);
@@ -205,7 +216,8 @@
       price,
       bidCount,
       text: fullText,
-      descriptionText: clean(descriptionParts.join('\n\n'))
+      descriptionHtml,
+      descriptionText
     };
   }
   async function writeAuctionText(record) {
@@ -216,21 +228,54 @@
       request.onerror = () => reject(request.error);
     });
   }
+  function compactDescriptionText(text) {
+    return String(text || '').replace(/\r/g, '').replace(/[\t\f\v ]*\n[\t\f\v ]*/g, '\n').replace(/\n{2,}/g, '\n').trim();
+  }
+
+  function deriveAucfreeDescription(text) {
+    const source = String(text || '');
+    const heading = /■\s*商品説明/.exec(source);
+    if (!heading) return '';
+    const start = heading.index + heading[0].length;
+    const footer = /▲\s*ページトップへ/.exec(source.slice(start));
+    if (!footer) return '';
+    return compactDescriptionText(source.slice(start, start + footer.index).replace(/^[\s:：]+|[\s:：]+$/g, ''));
+  }
+
+  function descriptionHtmlToText(html) {
+    if (!html) return '';
+    const withBreaks = String(html).replace(/<br\b[^>]*>/gi, '\n').replace(/<\/(?:div|p|li|h[1-6]|tr)\s*>/gi, '\n');
+    const doc = new DOMParser().parseFromString(withBreaks, 'text/html');
+    return compactDescriptionText((doc.body?.textContent || '').replace(/[\t\f\v ]+/g, ' ').replace(/ *\n */g, '\n'));
+  }
   function deriveYahooEmbeddedMetadata(source, id) {
-    if (!source || !id) return { auctionDate: '', price: '', bidCount: '' };
+    if (!source || !id) return { auctionDate: '', price: '', bidCount: '', descriptionHtml: '', descriptionText: '' };
     const escapedId = String(id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const marker = new RegExp(`"auctionId"\\s*:\\s*"${escapedId}"`).exec(source);
-    if (!marker) return { auctionDate: '', price: '', bidCount: '' };
+    if (!marker) return { auctionDate: '', price: '', bidCount: '', descriptionHtml: '', descriptionText: '' };
     // Yahoo's __NEXT_DATA__ item detail state keeps the canonical sale price
     // and endTime as JSON fields, even when the visible labels are missing.
-    const itemState = source.slice(marker.index, marker.index + 12000);
+    const nextItem = source.indexOf('\"auctionId\"', marker.index + marker[0].length);
+    const itemStateEnd = Math.min(marker.index + 50000, nextItem < 0 ? source.length : nextItem);
+    const itemState = source.slice(marker.index, itemStateEnd);
     const rawPrice = itemState.match(/"price"\s*:\s*(\d+(?:\.\d+)?)/)?.[1];
     const rawBidCount = itemState.match(/"bids"\s*:\s*(\d+)/)?.[1];
     const rawEndTime = itemState.match(/"endTime"\s*:\s*"((?:19|20)\d{2}-\d{2}-\d{2}T[^" ]+)"/)?.[1];
+    const rawDescriptionHtml = itemState.match(/"descriptionHtml"\s*:\s*"((?:\\.|[^"\\])*)"/)?.[1];
+    const rawDescriptionArray = itemState.match(/"description"\s*:\s*\[((?:\\.|[^\]])*)\]/)?.[1];
+    let descriptionHtml = '';
+    let descriptionText = '';
+    if (rawDescriptionHtml !== undefined) {
+      try { descriptionHtml = JSON.parse(`"${rawDescriptionHtml}"`); } catch { descriptionHtml = ''; }
+      descriptionText = descriptionHtmlToText(descriptionHtml);
+    }
+    if (!descriptionText && rawDescriptionArray !== undefined) {
+      try { descriptionText = JSON.parse(`[${rawDescriptionArray}]`).filter(value => typeof value === 'string').join('\n\n').trim(); } catch { descriptionText = ''; }
+    }
     const price = rawPrice === undefined ? '' : `${Number(rawPrice).toLocaleString('ja-JP')}円`;
     const auctionDate = rawEndTime ? rawEndTime.replace('T', ' ').replace(/([+-]\d{2}:\d{2})$/, '') : '';
     const bidCount = rawBidCount === undefined ? '' : rawBidCount;
-    return { auctionDate, price, bidCount };
+    return { auctionDate, price, bidCount, descriptionHtml, descriptionText };
   }
 
   function deriveAuctionMetadata(text, id) {
@@ -265,14 +310,19 @@
         request.onsuccess = () => {
           const record = request.result || null;
           if (!record) { resolve(null); return; }
+          const embedded = deriveYahooEmbeddedMetadata(record.text, id);
           const derived = deriveAuctionMetadata(record.text, id);
           const updated = {
             ...record,
             auctionDate: record.auctionDate || derived.auctionDate,
             price: record.price || derived.price,
-            bidCount: record.bidCount ?? derived.bidCount
+            bidCount: record.bidCount ?? derived.bidCount,
+            descriptionHtml: embedded.descriptionHtml || record.descriptionHtml || '',
+            descriptionText: compactDescriptionText(embedded.descriptionText || record.descriptionText || deriveAucfreeDescription(record.text))
           };
-          if (updated.auctionDate === record.auctionDate && updated.price === record.price && updated.bidCount === record.bidCount) {
+          if (updated.auctionDate === record.auctionDate && updated.price === record.price &&
+              updated.bidCount === record.bidCount && updated.descriptionHtml === record.descriptionHtml &&
+              updated.descriptionText === record.descriptionText) {
             resolve(record);
             return;
           }
@@ -674,6 +724,61 @@
     row.append(strong, document.createTextNode(value || '（キャッシュなし）'));
     parent.append(row);
   }
+  function safeDescriptionFragment(html) {
+    const parsed = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    const allowed = new Set(['DIV', 'P', 'BR', 'SPAN', 'B', 'STRONG', 'I', 'EM', 'U', 'S', 'UL', 'OL', 'LI']);
+    const fragment = document.createDocumentFragment();
+    const copyNode = (source, parent) => {
+      if (source.nodeType === Node.TEXT_NODE) {
+        const original = source.nodeValue || '';
+        let value = original.replace(/[\r\n\t ]+/g, ' ');
+        // Newlines and indentation between HTML tags are source formatting,
+        // not seller text. Drop those whitespace-only nodes in the preview.
+        if (!value.trim() && /[\r\n]/.test(original)) return;
+        parent.append(document.createTextNode(value));
+        return;
+      }
+      if (source.nodeType !== Node.ELEMENT_NODE) return;
+      const tag = source.tagName.toUpperCase();
+      const target = allowed.has(tag) ? document.createElement(tag.toLowerCase()) : parent;
+      if (target !== parent) {
+        if (['DIV', 'P', 'UL', 'OL', 'LI'].includes(tag)) target.style.cssText = 'margin:0;padding-top:0;padding-bottom:0;';
+        if (['UL', 'OL'].includes(tag)) target.style.paddingLeft = '1.5em';
+        parent.append(target);
+      }
+      source.childNodes.forEach(child => copyNode(child, target));
+    };
+    parsed.body.childNodes.forEach(node => copyNode(node, fragment));
+    const pruneEmpty = parent => {
+      for (const child of [...parent.childNodes]) {
+        if (child.nodeType !== Node.ELEMENT_NODE) continue;
+        pruneEmpty(child);
+        // Empty formatting wrappers can contain only BR tags; those still
+        // render as blank lines, so remove the whole empty subtree.
+        if (child.tagName !== 'BR' && !child.textContent.trim()) child.remove();
+      }
+    };
+    pruneEmpty(fragment);
+    // Collapse BRs across nested inline formatting elements too. Yahoo often
+    // wraps each break in a separate FONT/B/SPAN node, so sibling-only checks
+    // leave visually empty rows behind.
+    const state = { previousWasBreak: false };
+    const collapseBreaks = parent => {
+      for (const child of [...parent.childNodes]) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          if (child.nodeValue.trim()) state.previousWasBreak = false;
+        } else if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'BR') {
+          if (state.previousWasBreak) child.remove();
+          else state.previousWasBreak = true;
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          collapseBreaks(child);
+        }
+      }
+    };
+    collapseBreaks(fragment);
+    return fragment;
+  }
+
   async function showCachedAuction(dialog, input) {
     const id = normalizeInspectorId(input);
     const status = dialog.querySelector('[data-inspector-status]');
@@ -747,14 +852,28 @@
       textMode.style.cssText = 'padding:4px 7px;border:1px solid #999;border-radius:4px;background:#fff;';
       textMode.innerHTML = '<option value="description">商品紹介文</option><option value="raw">rawテキスト</option>';
       textControls.append(textTitle, textMode);
-      const textContent = document.createElement('pre');
+      const textContent = document.createElement('div');
       textContent.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:10px;border:1px solid #ddd;border-radius:5px;background:#fafafa;font:13px/1.5 sans-serif;max-height:260px;overflow:auto;';
-      const descriptionText = record?.descriptionText || '';
+      const descriptionText = compactDescriptionText(record?.descriptionText || '');
+      const descriptionHtml = record?.descriptionHtml || '';
       const rawText = record?.text || '';
       const noTextMessage = 'テキストキャッシュはありません。';
       const updateTextContent = () => {
-        const selectedText = textMode.value === 'raw' ? rawText : descriptionText;
-        textContent.textContent = selectedText || noTextMessage;
+        textContent.replaceChildren();
+        if (textMode.value === 'raw') {
+          const raw = document.createElement('pre');
+          raw.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:inherit;';
+          raw.textContent = rawText || noTextMessage;
+          textContent.append(raw);
+        } else if (descriptionHtml) {
+          textContent.append(safeDescriptionFragment(descriptionHtml));
+          if (!descriptionText && !textContent.textContent.trim()) textContent.textContent = noTextMessage;
+        } else {
+          const description = document.createElement('pre');
+          description.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:inherit;';
+          description.textContent = descriptionText || noTextMessage;
+          textContent.append(description);
+        }
       };
       textMode.addEventListener('change', updateTextContent);
       updateTextContent();

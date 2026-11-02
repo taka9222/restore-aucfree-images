@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Aucfree Yahoo Auction Image Restorer
 // @namespace    https://aucfree.com/
-// @version      1.1.2
+// @version      1.1.3
 // @description  Restore missing Aucfree item images and archive Yahoo auction images and text.
 // @match        https://aucfree.com/*
 // @match        https://www.aucfree.com/*
@@ -150,7 +150,6 @@
     if (expectedFullSizeCount === 0 && expectedDescriptionCount === 0) {
       return { noImages: true, expectedFullSizeCount, expectedDescriptionCount };
     }
-    if (!keys.has(thumbnailKey)) return null;
     const fullSizesComplete = Array.from(
       { length: expectedFullSizeCount }, (_, index) => keys.has(cacheKey(id, 'full-size', index))
     ).every(Boolean);
@@ -158,7 +157,13 @@
       { length: expectedDescriptionCount }, (_, index) => keys.has(cacheKey(id, 'item-description', index))
     ).every(Boolean);
     if (!fullSizesComplete || !descriptionsComplete) return null;
-    const thumbnail = await readBlob(thumbnailKey);
+    let thumbnail = await readBlob(thumbnailKey);
+    if (!thumbnail && expectedFullSizeCount > 0) {
+      // Repair older/incomplete caches by aliasing the already cached first
+      // full-size image instead of making another network request.
+      thumbnail = await readBlob(cacheKey(id, 'full-size', 0));
+      if (thumbnail && !await writeBlob(thumbnailKey, thumbnail)) thumbnail = null;
+    }
     return thumbnail ? { thumbnail, expectedFullSizeCount, expectedDescriptionCount } : null;
   }
   async function writeBlob(key, blob) {
@@ -571,6 +576,10 @@
           blob = await downloadBlob(requestUrl, id);
           if (!await writeBlob(key, blob)) throw new Error('IndexedDB write failed');
         }
+        if (kind === 'full-size' && index === 0) {
+          const thumbnailKey = cacheKey(id, 'thumbnail');
+          if (!await readBlob(thumbnailKey)) await writeBlob(thumbnailKey, blob);
+        }
         return blob;
       })().finally(() => imageRequests.delete(key));
       imageRequests.set(key, promise);
@@ -935,6 +944,12 @@
         // .3.jpg. A real image response is cached by trackCacheJob; the first
         // 404/410 or AccessDenied XML ends the sequence.
         confirmedGalleryCount = job.index;
+      }
+    }
+    if (galleryUrls.length > 0) {
+      const firstImage = await readBlob(cacheKey(id, 'full-size', 0));
+      if (firstImage && !await readBlob(cacheKey(id, 'thumbnail'))) {
+        await writeBlob(cacheKey(id, 'thumbnail'), firstImage);
       }
     }
     if (confirmMissingAsNoImages && confirmedGalleryCount !== null) {

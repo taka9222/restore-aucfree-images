@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Aucfree Yahoo Auction Image Restorer
 // @namespace    https://aucfree.com/
-// @version      1.1.3
+// @version      1.1.4
 // @description  Restore missing Aucfree item images and archive Yahoo auction images and text.
 // @match        https://aucfree.com/*
 // @match        https://www.aucfree.com/*
@@ -46,9 +46,18 @@
   let activeAucfreeTextRequest = false;
   let aucfreeTextPumpTimer = null;
   let lastAucfreeTextRequestAt = 0;
+  let lastAucfreeSearchPageRequestAt = 0;
+  let aucfreeRequestNotBefore = 0;
   const minAucfreeTextRequestInterval = 1000;
+  const minAucfreeSearchPageRequestInterval = 5000;
+  const aucfreeSearch403InitialBackoffMs = 60000;
+  const aucfreeRetryDelayMs = 5000;
+  const maxAucfreeTextRetries = 3;
+  const cachedSearchPages = new Set();
+  const scheduledSearchScans = new Set();
   let meterElement;
   let meterContainer;
+  let searchCacheButton;
   let cacheInspectorDialog;
   const cacheInspectorObjectUrls = [];
   let dbPromise;
@@ -343,30 +352,51 @@
   }
   function pumpAucfreeTextQueue() {
     if (activeAucfreeTextRequest || aucfreeTextPumpTimer || !aucfreeTextQueue.length) return;
-    const wait = Math.max(0, lastAucfreeTextRequestAt + minAucfreeTextRequestInterval - Date.now());
+    const wait = Math.max(0,
+      lastAucfreeTextRequestAt + minAucfreeTextRequestInterval - Date.now(),
+      aucfreeRequestNotBefore - Date.now());
     aucfreeTextPumpTimer = setTimeout(() => {
       aucfreeTextPumpTimer = null;
       if (activeAucfreeTextRequest || !aucfreeTextQueue.length) return;
-      const { id, resolve } = aucfreeTextQueue.shift();
+      if (Date.now() < aucfreeRequestNotBefore) {
+        pumpAucfreeTextQueue();
+        return;
+      }
+      const task = aucfreeTextQueue.shift();
+      const { id, resolve } = task;
       activeAucfreeTextRequest = true;
       lastAucfreeTextRequestAt = Date.now();
       let settled = false;
-      const finish = saved => {
+      const finish = result => {
         if (settled) return;
         settled = true;
         activeAucfreeTextRequest = false;
-        resolve(saved);
+        resolve(result);
         pumpAucfreeTextQueue();
       };
-      console.info(`[Aucfree text archive] ${id}: fetching Aucfree fallback (one request at a time; minimum ${minAucfreeTextRequestInterval} ms interval).`);
+      const retryOrFinish = reason => {
+        activeAucfreeTextRequest = false;
+        if ((task.attempts || 0) < maxAucfreeTextRetries) {
+          task.attempts = (task.attempts || 0) + 1;
+          console.warn(`[Aucfree text archive] ${id}: fallback failed (${reason}); retry ${task.attempts}/${maxAucfreeTextRetries} in ${aucfreeRetryDelayMs} ms.`);
+          setTimeout(() => {
+            aucfreeTextQueue.push(task);
+            pumpAucfreeTextQueue();
+          }, aucfreeRetryDelayMs);
+          pumpAucfreeTextQueue();
+          return;
+        }
+        console.warn(`[Aucfree text archive] ${id}: fallback failed after ${maxAucfreeTextRetries + 1} attempts (${reason}).`);
+        finish({ ok: false, textSaved: false, images: null });
+      };
+      console.info(`[Aucfree text archive] ${id}: fetching Aucfree fallback (attempt ${(task.attempts || 0) + 1}/${maxAucfreeTextRetries + 1}; one request at a time; minimum ${minAucfreeTextRequestInterval} ms interval).`);
       GM_xmlhttpRequest({
         method: 'GET',
         url: `https://aucfree.com/items/${encodeURIComponent(id)}`,
         timeout: 10000,
         onload: async response => {
           if (response.status < 200 || response.status >= 400) {
-            console.warn(`[Aucfree text archive] ${id}: Aucfree fallback returned HTTP ${response.status}.`);
-            finish(false);
+            retryOrFinish(`HTTP ${response.status}`);
             return;
           }
           try {
@@ -397,11 +427,11 @@
             finish({ ok: true, textSaved, images });
           } catch (error) {
             console.warn(`[Aucfree text archive] ${id}: Aucfree fallback text was not saved.`, error);
-            finish(false);
+            retryOrFinish('response parsing or cache write error');
           }
         },
-        onerror: () => finish({ ok: false, textSaved: false, images: null }),
-        ontimeout: () => finish({ ok: false, textSaved: false, images: null })
+        onerror: () => retryOrFinish('network error'),
+        ontimeout: () => retryOrFinish('timeout')
       });
     }, wait);
   }
@@ -675,11 +705,22 @@
     inspectButton.textContent = 'キャッシュデータを確認';
     inspectButton.style.cssText = 'align-self:flex-end;padding:6px 10px;border:1px solid #777;border-radius:6px;background:#fff;color:#222;font:12px sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.18);';
     inspectButton.addEventListener('click', openCacheInspector);
+    searchCacheButton = document.createElement('button');
+    searchCacheButton.type = 'button';
+    searchCacheButton.textContent = '全ページをキャッシュ';
+    searchCacheButton.style.cssText = 'align-self:flex-end;padding:7px 10px;border:1px solid #176b35;border-radius:6px;background:#238636;color:#fff;font:12px sans-serif;font-weight:700;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.18);';
+    searchCacheButton.addEventListener('click', () => {
+      const url = new URL(location.href);
+      url.searchParams.delete('p');
+      url.searchParams.set('cacheall', 'True');
+      location.assign(url.href);
+    });
     meterElement = document.createElement('section');
     meterElement.style.cssText = 'box-sizing:border-box;width:100%;padding:10px 12px;border:1px solid #888;border-radius:8px;background:rgba(255,255,255,.96);box-shadow:0 2px 10px rgba(0,0,0,.2);color:#222;font:12px/1.4 sans-serif;';
     meterElement.innerHTML = '<div style="font-weight:700;margin-bottom:7px">このページのキャッシュ進捗</div><div>画像 <span data-meter-image-summary>0 / 0 保存済み</span></div><div style="height:6px;margin:4px 0;background:#e5e5e5;border-radius:5px;overflow:hidden"><div data-meter-image-fill style="height:100%;width:0;background:#238636;transition:width .2s"></div></div><div data-meter-image-detail style="color:#555;margin-bottom:7px">処理中 0　失敗 0</div><div>テキスト <span data-meter-text-summary>0 / 0 保存済み</span></div><div style="height:6px;margin:4px 0;background:#e5e5e5;border-radius:5px;overflow:hidden"><div data-meter-text-fill style="height:100%;width:0;background:#0969da;transition:width .2s"></div></div><div data-meter-text-detail style="color:#555">処理中 0　失敗 0</div>';
-    meterContainer.append(inspectButton, meterElement);
+    meterContainer.append(searchCacheButton, inspectButton, meterElement);
     document.body.append(meterContainer);
+    updateSearchCacheButton();
     updateCacheMeter();
   }
   function revokeCacheInspectorUrls() {
@@ -1395,6 +1436,181 @@
     restoreListCard(card, id, missing);
   }
 
+  function searchConditionKey(url) {
+    const copy = new URL(url.href);
+    copy.searchParams.delete('p');
+    copy.searchParams.delete('cacheall');
+    copy.hash = '';
+    const entries = [...copy.searchParams.entries()].sort(([aKey, aValue], [bKey, bValue]) =>
+      aKey.localeCompare(bKey) || aValue.localeCompare(bValue));
+    copy.search = '';
+    for (const [key, value] of entries) copy.searchParams.append(key, value);
+    return copy.href;
+  }
+  function pageItemIds(doc) {
+    return [...new Set([...doc.querySelectorAll('a[href*="/items/"]')]
+      .map(link => idFrom(link.href)).filter(Boolean))];
+  }
+  function maxSearchPage(doc, baseUrl) {
+    let maxPage = 1;
+    for (const link of doc.querySelectorAll('a[href*="/search"]')) {
+      try {
+        const candidate = new URL(link.href, baseUrl);
+        if (candidate.pathname !== baseUrl.pathname || searchConditionKey(candidate) !== searchConditionKey(baseUrl)) continue;
+        const page = Number(candidate.searchParams.get('p') || 1);
+        if (Number.isInteger(page) && page > maxPage) maxPage = page;
+      } catch { /* Ignore malformed pagination links. */ }
+    }
+    return maxPage;
+  }
+  async function requestAucfreeSearchPage(url) {
+    // Share the same single-request gate and minimum interval as Aucfree item
+    // fallbacks so a whole-search crawl never creates parallel Aucfree traffic.
+    while (true) {
+      if (activeAucfreeTextRequest || aucfreeTextQueue.length || aucfreeTextPumpTimer) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      const intervalWait = Math.max(
+        lastAucfreeTextRequestAt + minAucfreeTextRequestInterval - Date.now(),
+        lastAucfreeSearchPageRequestAt + minAucfreeSearchPageRequestInterval - Date.now(),
+        aucfreeRequestNotBefore - Date.now()
+      );
+      if (intervalWait > 0) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(intervalWait, 100)));
+        continue;
+      }
+      break;
+    }
+    activeAucfreeTextRequest = true;
+    lastAucfreeTextRequestAt = Date.now();
+    lastAucfreeSearchPageRequestAt = Date.now();
+    try {
+      return await new Promise((resolve, reject) => GM_xmlhttpRequest({
+        method: 'GET',
+        url: url.href,
+        timeout: 15000,
+        onload: response => {
+          if (response.status >= 200 && response.status < 400) resolve(response.responseText || '');
+          else reject(new Error(`HTTP ${response.status}`));
+        },
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timeout'))
+      }));
+    } finally {
+      activeAucfreeTextRequest = false;
+      pumpAucfreeTextQueue();
+    }
+  }
+  async function requestAucfreeSearchPageWithRetry(url, conditionKey) {
+    let consecutive403 = 0;
+    while (true) {
+      try {
+        return await requestAucfreeSearchPage(url);
+      } catch (error) {
+        if (error?.message !== 'HTTP 403') throw error;
+        consecutive403++;
+        const delay = aucfreeSearch403InitialBackoffMs;
+        aucfreeRequestNotBefore = Math.max(aucfreeRequestNotBefore, Date.now() + delay);
+        console.warn(`[Aucfree search archive] HTTP 403 for ${url.searchParams.get('p') || 1}; pausing all Aucfree requests for ${Math.ceil(delay / 1000)} seconds before retry ${consecutive403}.`);
+        while (Date.now() < aucfreeRequestNotBefore) {
+          await new Promise(resolve => setTimeout(resolve, Math.min(1000, aucfreeRequestNotBefore - Date.now())));
+          const current = new URL(location.href);
+          if (current.pathname !== '/search' || current.searchParams.get('cacheall')?.toLowerCase() !== 'true' ||
+              searchConditionKey(current) !== conditionKey) {
+            throw new Error('Full-search cache cancelled because the active cacheall URL changed.');
+          }
+        }
+      }
+    }
+  }
+  function cacheSearchItem(id) {
+    void (async () => {
+      const cached = await readCompleteCachedThumbnail(id);
+      if (cached) {
+        setTextJobStatus(id, 'saved');
+        if (cached.noImages) {
+          console.info(`[Aucfree search archive] ${id}: complete cache found (auction-text and confirmed zero images); skipping Yahoo fetch.`);
+        } else {
+          console.info(`[Aucfree search archive] ${id}: complete cache found (thumbnail, ${cached.expectedFullSizeCount} full-size, ${cached.expectedDescriptionCount} description images, and auction-text); skipping Yahoo fetch.`);
+        }
+        return;
+      }
+      await ensureAuctionText(id);
+      const images = await imagesFor(id);
+      await warmImageCache(id, images);
+    })().catch(error => console.warn(`[Aucfree search archive] ${id}: cache job failed.`, error));
+  }
+  function cacheAllSearchPages(doc) {
+    const current = new URL(location.href);
+    if (current.pathname !== '/search' || !['', '1'].includes(current.searchParams.get('p') || '') ||
+        current.searchParams.get('cacheall')?.toLowerCase() !== 'true') return;
+    const conditionKey = searchConditionKey(current);
+    if (cachedSearchPages.has(conditionKey)) return;
+    cachedSearchPages.add(conditionKey);
+    const maxPage = maxSearchPage(doc, current);
+    const firstPageIds = pageItemIds(doc);
+    console.info(`[Aucfree search archive] First page detected: caching ${firstPageIds.length} visible items across up to ${maxPage} pages for this search.`);
+    firstPageIds.forEach(cacheSearchItem);
+    if (maxPage <= 1) return;
+    void (async () => {
+      for (let page = 2; page <= maxPage; page++) {
+        const pageUrl = new URL(current.href);
+        pageUrl.searchParams.set('p', String(page));
+        pageUrl.searchParams.delete('cacheall');
+        try {
+          const html = await requestAucfreeSearchPageWithRetry(pageUrl, conditionKey);
+          const pageDoc = new DOMParser().parseFromString(html, 'text/html');
+          const ids = pageItemIds(pageDoc);
+          console.info(`[Aucfree search archive] Page ${page}/${maxPage}: found ${ids.length} items.`);
+          ids.forEach(cacheSearchItem);
+        } catch (error) {
+          console.warn(`[Aucfree search archive] Page ${page}/${maxPage} could not be fetched; continuing.`, error);
+        }
+      }
+      console.info(`[Aucfree search archive] Finished enumerating pages for this search.`);
+    })();
+  }
+  function scheduleSearchPageCache(doc) {
+    const current = new URL(location.href);
+    if (current.pathname !== '/search' || !['', '1'].includes(current.searchParams.get('p') || '') ||
+        current.searchParams.get('cacheall')?.toLowerCase() !== 'true') return;
+    const key = searchConditionKey(current);
+    if (cachedSearchPages.has(key) || scheduledSearchScans.has(key)) return;
+    scheduledSearchScans.add(key);
+    // Let client-side pagination markup finish hydrating before determining the
+    // final page count. This only delays discovery; item cache work is queued
+    // immediately after the scan.
+    setTimeout(() => {
+      scheduledSearchScans.delete(key);
+      if (searchConditionKey(new URL(location.href)) === key) cacheAllSearchPages(doc);
+    }, 750);
+  }
+  function updateSearchCacheButton() {
+    if (!searchCacheButton) return;
+    const url = new URL(location.href);
+    const isSearchPage = url.pathname === '/search';
+    const isRunning = url.searchParams.get('cacheall')?.toLowerCase() === 'true';
+    searchCacheButton.hidden = !isSearchPage;
+    searchCacheButton.disabled = isRunning;
+    searchCacheButton.textContent = isRunning ? '全ページをキャッシュ中…' : '全ページをキャッシュ';
+    searchCacheButton.style.opacity = isRunning ? '0.7' : '1';
+    searchCacheButton.style.cursor = isRunning ? 'default' : 'pointer';
+  }
+  function stripCacheAllFromNavigation(event) {
+    if (new URL(location.href).searchParams.get('cacheall')?.toLowerCase() !== 'true') return;
+    const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    if (!anchor) return;
+    try {
+      const destination = new URL(anchor.href, location.href);
+      if (destination.origin !== location.origin || !destination.searchParams.has('cacheall')) return;
+      destination.searchParams.delete('cacheall');
+      anchor.href = destination.href;
+    } catch { /* Leave nonstandard navigation URLs untouched. */ }
+  }
+  document.addEventListener('click', stripCacheAllFromNavigation, true);
+  document.addEventListener('auxclick', stripCacheAllFromNavigation, true);
+
   function scanRoot(root) {
     if (!(root instanceof Element || root instanceof Document)) return;
     const detailId = location.pathname.match(itemPath)?.[1];
@@ -1412,6 +1628,7 @@
     root.querySelectorAll?.('a[href*="/items/"]').forEach(link => links.push(link));
     const cards = new Set(links.map(cardFor).filter(Boolean));
     cards.forEach(queueCard);
+    scheduleSearchPageCache(document);
   }
 
   const style = document.createElement('style');
@@ -1422,6 +1639,7 @@
   function runForCurrentUrl(force = false) {
     if (!force && location.href === lastUrl) return;
     lastUrl = location.href;
+    updateSearchCacheButton();
     const detailId = location.pathname.match(itemPath)?.[1];
     if (detailId) imagesFor(detailId).then(images => {
       restoreDetail(document, detailId, images);
@@ -1430,9 +1648,26 @@
     scanRoot(document);
   }
   runForCurrentUrl(true);
+  function withoutCacheAllOnNavigation(value) {
+    if (new URL(location.href).searchParams.get('cacheall')?.toLowerCase() !== 'true' || value == null) return value;
+    try {
+      const target = new URL(String(value), location.href);
+      if (target.origin !== location.origin || !target.searchParams.has('cacheall')) return value;
+      target.searchParams.delete('cacheall');
+      return target.href;
+    } catch { return value; }
+  }
+  document.addEventListener('click', event => {
+    if (new URL(location.href).searchParams.get('cacheall')?.toLowerCase() !== 'true') return;
+    const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    if (!anchor) return;
+    const cleaned = withoutCacheAllOnNavigation(anchor.href);
+    if (cleaned !== anchor.href) anchor.href = cleaned;
+  }, true);
   for (const method of ['pushState', 'replaceState']) {
     const original = history[method];
     history[method] = function (...args) {
+      if (args.length > 2) args[2] = withoutCacheAllOnNavigation(args[2]);
       const result = original.apply(this, args);
       queueMicrotask(() => runForCurrentUrl());
       return result;
